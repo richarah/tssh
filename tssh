@@ -1,0 +1,174 @@
+#!/bin/sh
+# tssh: one ssh session over Tailscale, without root, without installing
+# anything, and without touching the rest of the machine. Plain POSIX sh.
+#
+#   ./tssh [ssh options] [user@]host [command]
+#
+# host is a tailnet name (MagicDNS short name or FQDN) or a 100.x address.
+# Everything tssh creates lives next to this script:
+#   bin/        tailscale + tailscaled (fetched on first run if missing)
+#   state/      node identity and logs, so you only log in once
+#   run/        socket, pid, lock and daemon log while running
+#   known_hosts host keys seen through tssh (your ~/.ssh is only read)
+#
+# Environment:
+#   TS_AUTHKEY      auth key for headless login (otherwise a URL is printed)
+#   TSSH_EPHEMERAL  1 = keep no identity on disk; needs an ephemeral TS_AUTHKEY,
+#                   and the node is logged out and removed on exit
+#   TSSH_HOSTNAME   name this node shows in the tailnet (default tssh-<host>)
+#
+# Needs: ssh, flock (util-linux or busybox), and curl + tar only for the
+# first-run download.
+
+set -eu
+
+# Resolve the folder this script lives in, following a symlink if there is one
+self=$0
+while [ -h "$self" ]; do
+    link=$(ls -ld "$self" | sed 's/.* -> //')
+    case $link in
+        /*) self=$link ;;
+        *)  self=$(dirname "$self")/$link ;;
+    esac
+done
+D=$(cd "$(dirname "$self")" && pwd -P)
+
+BIN=$D/bin
+STATE=$D/state
+RUN=$D/run
+SOCK=$RUN/tailscaled.sock
+PIDF=$RUN/tailscaled.pid
+LOG=$RUN/tailscaled.log
+NODE_NAME=${TSSH_HOSTNAME:-tssh-$(hostname 2>/dev/null | cut -d. -f1 || echo node)}
+EPHEMERAL=${TSSH_EPHEMERAL:-0}
+
+die() { printf 'tssh: %s\n' "$*" >&2; exit 1; }
+ts()  { "$BIN/tailscale" --socket="$SOCK" "$@"; }
+alive() { ts version --daemon >/dev/null 2>&1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+[ $# -ge 1 ] || die "usage: tssh [ssh options] [user@]host [command]"
+have ssh   || die "ssh not found"
+have flock || die "flock not found (util-linux or busybox)"
+
+# Fetch the static binaries once
+if [ ! -x "$BIN/tailscaled" ] || [ ! -x "$BIN/tailscale" ]; then
+    case $(uname -m) in
+        x86_64)        arch=amd64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        armv7l|armv6l) arch=arm ;;
+        i?86)          arch=386 ;;
+        riscv64)       arch=riscv64 ;;
+        *) die "unknown architecture $(uname -m); put tailscale and tailscaled in $BIN yourself" ;;
+    esac
+    have curl || die "curl needed to fetch tailscale; or put the binaries in $BIN"
+    base=https://pkgs.tailscale.com/stable
+    file=$(curl -fsSL "$base/?mode=json" | grep -o "tailscale_[0-9.]*_${arch}\.tgz" | head -n 1)
+    [ -n "$file" ] || die "could not find a tarball for $arch at $base"
+    printf 'tssh: fetching %s\n' "$file" >&2
+    tmp=$D/.fetch.$$
+    rm -rf "$tmp"
+    mkdir -p "$tmp" "$BIN"
+    if [ -t 2 ]; then
+        curl -fL --progress-bar "$base/$file" -o "$tmp/ts.tgz"
+    else
+        curl -fsSL "$base/$file" -o "$tmp/ts.tgz"
+    fi
+    gzip -dc "$tmp/ts.tgz" | (cd "$tmp" && tar -xf -)
+    dir=$tmp/${file%.tgz}
+    [ -x "$dir/tailscale" ] && [ -x "$dir/tailscaled" ] || die "unexpected tarball layout in $file"
+    mv "$dir/tailscale" "$dir/tailscaled" "$BIN/"
+    rm -rf "$tmp"
+fi
+
+mkdir -p "$RUN" "$STATE"
+chmod 700 "$STATE" "$RUN"
+
+# Several tssh sessions may share one daemon. Each live session holds a shared
+# lock on fd 9; fd 8 is a short mutex around starting and stopping. The last
+# session out (the one that can take fd 9 exclusively) stops the daemon.
+exec 8>"$RUN/startstop.lock" 9>"$RUN/session.lock"
+flock 8
+
+cleanup() {
+    trap - EXIT INT TERM HUP
+    flock 8
+    if flock -n 9; then
+        if [ "$EPHEMERAL" = 1 ] && alive; then
+            ts logout >/dev/null 2>&1 &
+            lp=$!
+            n=0
+            while [ $n -lt 50 ] && kill -0 "$lp" 2>/dev/null; do sleep 0.1; n=$((n + 1)); done
+            kill "$lp" 2>/dev/null || true
+        fi
+        if [ -f "$PIDF" ]; then
+            pid=$(cat "$PIDF")
+            kill "$pid" 2>/dev/null || true
+            n=0
+            while [ $n -lt 50 ] && kill -0 "$pid" 2>/dev/null; do sleep 0.1; n=$((n + 1)); done
+            kill -9 "$pid" 2>/dev/null || true
+            rm -f "$PIDF"
+        fi
+        rm -f "$SOCK"
+    fi
+    flock -u 8
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
+if ! alive; then
+    if [ "$EPHEMERAL" = 1 ]; then
+        [ -n "${TS_AUTHKEY:-}" ] || die "TSSH_EPHEMERAL=1 needs an ephemeral TS_AUTHKEY"
+        state_arg=--state=mem:
+    else
+        state_arg=--statedir=$STATE
+    fi
+    # the lock fds are closed for the daemon so it never holds the locks itself
+    TS_LOGS_DIR=$STATE "$BIN/tailscaled" \
+        --tun=userspace-networking \
+        --socket="$SOCK" \
+        --port=0 \
+        "$state_arg" \
+        >"$LOG" 2>&1 8>&- 9>&- &
+    echo $! >"$PIDF"
+    n=0
+    while [ $n -lt 100 ]; do
+        alive && break
+        kill -0 "$(cat "$PIDF")" 2>/dev/null || die "tailscaled exited; see $LOG"
+        sleep 0.1
+        n=$((n + 1))
+    done
+    alive || die "tailscaled did not come up; see $LOG"
+fi
+
+# --shields-up: refuse all inbound connections. Userspace mode would otherwise
+# forward tailnet connections to this machine's localhost ports.
+ts up --reset --shields-up --hostname="$NODE_NAME" --accept-dns=false \
+    ${TS_AUTHKEY:+"--auth-key=$TS_AUTHKEY"} >&2 \
+    || die "tailscale up failed; see $LOG"
+
+# A fresh daemon reports Running before it has its peers and paths. Wait
+# until the destination answers over the tailnet, or ssh's first SYN is lost.
+target=$(ssh -G "$@" 2>/dev/null | awk '$1 == "hostname" { print $2; exit }')
+if [ -n "$target" ]; then
+    n=0
+    until ts ping -c 1 --until-direct=false --timeout=2s "$target" >/dev/null 2>&1; do
+        n=$((n + 1))
+        [ $n -lt 15 ] || die "no reply from $target over the tailnet; see $LOG"
+        sleep 0.5
+    done
+fi
+
+# Register this session, then let others start
+flock -s 9
+flock -u 8
+
+set +e
+ssh \
+    -o ProxyCommand="\"$BIN/tailscale\" --socket=\"$SOCK\" nc %h %p" \
+    -o UserKnownHostsFile="$D/known_hosts" \
+    "$@" 8>&- 9>&-
+rc=$?
+set -e
+exit "$rc"
